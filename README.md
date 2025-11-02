@@ -387,7 +387,7 @@ Contributions welcome! Please open an issue or PR on [GitHub](https://github.com
 
 ## License
 
-MIT © [Your Name]
+MIT © 0xhardman
 
 ## Related
 
