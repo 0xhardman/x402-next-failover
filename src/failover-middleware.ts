@@ -115,10 +115,30 @@ export function createPaymentMiddlewareWithFailover(
   facilitatorConfigs: FacilitatorConfig[],
   paywall?: Parameters<typeof paymentMiddleware>[3]
 ): (request: NextRequest) => Promise<Response> {
+  // Validate input parameters
+  if (!facilitatorConfigs || facilitatorConfigs.length === 0) {
+    throw new Error(
+      "[x402-next-failover] At least one facilitator configuration is required"
+    );
+  }
+
+  if (!wallet || !wallet.startsWith("0x") || wallet.length !== 42) {
+    throw new Error(
+      "[x402-next-failover] Invalid wallet address format (expected 0x followed by 40 hex characters)"
+    );
+  }
+
   // Convert configs to options and filter out invalid ones
   const facilitators = facilitatorConfigs
     .map(convertToFacilitatorOption)
     .filter((f): f is FacilitatorOption => f !== null);
+
+  // Verify at least one valid facilitator after filtering
+  if (facilitators.length === 0) {
+    throw new Error(
+      "[x402-next-failover] No valid facilitator configurations found (all configs were invalid or missing required fields)"
+    );
+  }
 
   // Sort facilitators by priority (lower number = higher priority)
   const sortedFacilitators = [...facilitators].sort(
@@ -148,28 +168,59 @@ export function createPaymentMiddlewareWithFailover(
       const { name, middleware, timeoutMs } = middlewareInstances[i];
       const timeout = timeoutMs || DEFAULT_TIMEOUT_MS;
 
+      // Clone request for each facilitator to support failover
+      // In Next.js, request body can only be read once
+      let requestToUse: NextRequest;
+      try {
+        requestToUse = request.clone() as NextRequest;
+      } catch (cloneError) {
+        console.error(
+          `[x402-next-failover] Cannot clone request for ${name}:`,
+          cloneError instanceof Error ? cloneError.message : String(cloneError)
+        );
+        // Fallback to original request if cloning fails
+        requestToUse = request;
+      }
+
+      let timeoutId: NodeJS.Timeout | null = null;
+
       try {
         console.log(
           `[x402-next-failover] Trying facilitator: ${name} (timeout: ${timeout}ms)`
         );
 
-        // Create timeout promise
+        // Create timeout promise with cleanup capability
         const timeoutPromise = new Promise<never>((_, reject) => {
-          setTimeout(() => {
+          timeoutId = setTimeout(() => {
             reject(new Error(`Timeout after ${timeout}ms`));
           }, timeout);
         });
 
         // Race between middleware call and timeout
         const response = await Promise.race([
-          middleware(request),
+          middleware(requestToUse),
           timeoutPromise,
         ]);
+
+        // Clear timeout if request succeeded before timeout
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
 
         // Check for invalid 402 responses (facilitator malfunction)
         // A valid 402 response should have either error or accepts fields
         if (response.status === 402) {
           try {
+            // Check if response body has already been consumed
+            if (response.bodyUsed) {
+              console.warn(
+                `[x402-next-failover] Cannot validate ${name} 402 response: body already consumed`
+              );
+              return response;
+            }
+
+            // Clone response for validation
             const clonedResponse = response.clone();
             const body = (await clonedResponse.json()) as {
               error?: string;
@@ -193,21 +244,22 @@ export function createPaymentMiddlewareWithFailover(
               // If this is the last facilitator, return the original response
               return response;
             }
-          } catch (parseError) {
-            // JSON parsing failed - also a facilitator error
-            const errorMsg = "Invalid 402 response: malformed JSON";
-            errors.push({ facilitator: name, error: errorMsg });
+          } catch (validationError) {
+            // Response cloning or JSON parsing failed
+            // This could be due to: body already consumed, invalid JSON, or clone failure
+            const errorMsg =
+              validationError instanceof Error
+                ? validationError.message
+                : "Failed to validate 402 response";
 
-            console.warn(
-              `[x402-next-failover] ${name} returned unparseable 402 response, trying next facilitator...`
+            console.error(
+              `[x402-next-failover] Error validating ${name} 402 response:`,
+              errorMsg
             );
 
-            // If this is not the last facilitator, continue to next
-            if (i < middlewareInstances.length - 1) {
-              continue;
-            }
-
-            // If this is the last facilitator, return the original response
+            // Don't failover on validation errors - return the original response
+            // This prevents false positives when the response is actually valid
+            // but we failed to validate it (e.g., due to Edge Runtime limitations)
             return response;
           }
         }
@@ -240,6 +292,12 @@ export function createPaymentMiddlewareWithFailover(
 
         return response;
       } catch (error) {
+        // Clear timeout in case of error
+        if (timeoutId) {
+          clearTimeout(timeoutId);
+          timeoutId = null;
+        }
+
         const errorMsg =
           error instanceof Error ? error.message : String(error);
         errors.push({ facilitator: name, error: errorMsg });
@@ -267,10 +325,14 @@ export function createPaymentMiddlewareWithFailover(
       errors
     );
 
+    // Only expose error details in development environment
+    const isDevelopment = process.env.NODE_ENV === "development";
+
     return new Response(
       JSON.stringify({
         error: "All payment facilitators are currently unavailable",
-        details: errors,
+        // Only include details in development to prevent information leakage
+        ...(isDevelopment && { details: errors }),
         timestamp: new Date().toISOString(),
       }),
       {
