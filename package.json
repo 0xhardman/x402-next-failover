@@ -1,6 +1,6 @@
 {
   "name": "x402-next-failover",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Automatic failover middleware for x402 payment facilitators in Next.js with timeout support",
   "main": "./dist/index.js",
   "module": "./dist/index.mjs",
