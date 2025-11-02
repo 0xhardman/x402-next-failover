@@ -68,6 +68,7 @@ function convertToFacilitatorOption(
  * @param wallet - Wallet address to receive payments
  * @param routes - Route configuration for payment middleware
  * @param facilitatorConfigs - Array of facilitator configurations
+ * @param paywall - Optional paywall configuration for customizing the payment UI
  * @returns Middleware function with failover support
  *
  * @example
@@ -99,14 +100,20 @@ function convertToFacilitatorOption(
  *       config: { ... }
  *     }
  *   },
- *   facilitators
+ *   facilitators,
+ *   {
+ *     cdpClientKey: "your-cdp-client-key",
+ *     appName: "My App",
+ *     appLogo: "/logo.svg"
+ *   }
  * );
  * ```
  */
 export function createPaymentMiddlewareWithFailover(
   wallet: `0x${string}`,
   routes: Parameters<typeof paymentMiddleware>[1],
-  facilitatorConfigs: FacilitatorConfig[]
+  facilitatorConfigs: FacilitatorConfig[],
+  paywall?: Parameters<typeof paymentMiddleware>[3]
 ): (request: NextRequest) => Promise<Response> {
   // Convert configs to options and filter out invalid ones
   const facilitators = facilitatorConfigs
@@ -121,7 +128,7 @@ export function createPaymentMiddlewareWithFailover(
   // Create a middleware instance for each facilitator
   const middlewareInstances = sortedFacilitators.map((facilitator) => ({
     ...facilitator,
-    middleware: paymentMiddleware(wallet, routes, facilitator.config),
+    middleware: paymentMiddleware(wallet, routes, facilitator.config, paywall),
   }));
 
   console.log(
@@ -158,6 +165,52 @@ export function createPaymentMiddlewareWithFailover(
           middleware(request),
           timeoutPromise,
         ]);
+
+        // Check for invalid 402 responses (facilitator malfunction)
+        // A valid 402 response should have either error or accepts fields
+        if (response.status === 402) {
+          try {
+            const clonedResponse = response.clone();
+            const body = (await clonedResponse.json()) as {
+              error?: string;
+              accepts?: unknown[];
+            };
+
+            // If both error and accepts are missing/empty, this is a facilitator error
+            if (!body.error && (!body.accepts || body.accepts.length === 0)) {
+              const errorMsg = "Invalid 402 response: missing error and accepts fields";
+              errors.push({ facilitator: name, error: errorMsg });
+
+              console.warn(
+                `[x402-next-failover] ${name} returned malformed 402 response, trying next facilitator...`
+              );
+
+              // If this is not the last facilitator, continue to next
+              if (i < middlewareInstances.length - 1) {
+                continue;
+              }
+
+              // If this is the last facilitator, return the original response
+              return response;
+            }
+          } catch (parseError) {
+            // JSON parsing failed - also a facilitator error
+            const errorMsg = "Invalid 402 response: malformed JSON";
+            errors.push({ facilitator: name, error: errorMsg });
+
+            console.warn(
+              `[x402-next-failover] ${name} returned unparseable 402 response, trying next facilitator...`
+            );
+
+            // If this is not the last facilitator, continue to next
+            if (i < middlewareInstances.length - 1) {
+              continue;
+            }
+
+            // If this is the last facilitator, return the original response
+            return response;
+          }
+        }
 
         // Check if response indicates failure
         // We consider 5xx errors as facilitator failures that should trigger failover

@@ -13,3 +13,5 @@ export type {
   FacilitatorError,
   FailoverErrorResponse,
 } from "./types";
+// Re-export PaywallConfig from x402-next for convenience
+export type { PaywallConfig } from "x402/types";
