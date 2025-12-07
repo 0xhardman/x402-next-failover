@@ -8,7 +8,7 @@
 import { paymentMiddleware } from "x402-next";
 import { createFacilitatorConfig } from "@coinbase/x402";
 import type { FacilitatorConfig as X402FacilitatorConfig } from "x402/types";
-import type { NextRequest } from "next/server";
+import { NextRequest } from "next/server";
 import type { FacilitatorConfig, FacilitatorError } from "./types";
 
 // Default timeout for facilitator requests (5 seconds)
@@ -170,9 +170,18 @@ export function createPaymentMiddlewareWithFailover(
 
       // Clone request for each facilitator to support failover
       // In Next.js, request body can only be read once
+      // Must use NextRequest constructor to preserve nextUrl property
       let requestToUse: NextRequest;
       try {
-        requestToUse = request.clone() as NextRequest;
+        // Clone the underlying Request first, then wrap in NextRequest
+        const clonedRequest = request.clone();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        requestToUse = new NextRequest(clonedRequest.url, {
+          method: clonedRequest.method,
+          headers: clonedRequest.headers,
+          body: clonedRequest.body,
+          duplex: "half",
+        } as any);
       } catch (cloneError) {
         console.error(
           `[x402-next-failover] Cannot clone request for ${name}:`,
